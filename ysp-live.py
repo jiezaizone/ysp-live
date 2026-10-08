@@ -612,8 +612,48 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _public_origin(self):
+        # 容器前面是 HTTPS 反代时，到这里的连接仍是 HTTP，Host 却是对外域名。
+        # 订阅清单必须按客户端看到的协议来写，否则 https 订阅里会混进 http 频道地址。
+        host = (self.headers.get('X-Forwarded-Host') or self.headers.get('Host') or 'localhost:8766')
+        host = host.split(',')[0].strip()
+        proto = ''
+        for key in ('X-Forwarded-Proto', 'X-Forwarded-Scheme'):
+            proto = (self.headers.get(key) or '').split(',')[0].strip().lower()
+            if proto in ('http', 'https'):
+                break
+            proto = ''
+        if not proto:
+            m = re.search(r'(?i)\bproto=(https?)\b', self.headers.get('Forwarded') or '')
+            if m:
+                proto = m.group(1).lower()
+        port = ''
+        if host.startswith('[') and ']:' in host:
+            port = host.rsplit(':', 1)[-1]
+        elif host.count(':') == 1:
+            port = host.split(':', 1)[1]
+        # 4433 是对外 TLS 端口。反代有时把 X-Forwarded-Proto 写成后端的 http，不能据此把订阅地址改回 http。
+        if port in ('443', '4433'):
+            proto = 'https'
+        elif proto not in ('http', 'https'):
+            proto = 'http'
+        return '%s://%s' % (proto, host)
+
+    def _wants_player_page(self):
+        # 浏览器地址栏打开时给播放页。IPTV / hls.js / VLC 不带 document 导航，仍拿原始清单。
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        if qs.get('raw'):
+            return False
+        dest = (self.headers.get('Sec-Fetch-Dest') or '').lower()
+        if dest == 'document':
+            return True
+        if dest:
+            return False
+        return 'text/html' in (self.headers.get('Accept') or '')
+
     def do_GET(self):
-        path = urllib.parse.urlparse(self.path).path
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
         if path in ('/', '/index.html'):
             self._send(200, index_page(), 'text/html; charset=utf-8')
             return
@@ -621,11 +661,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, 'ok')
             return
         if path == '/all.m3u':
-            host = self.headers.get('Host', 'localhost:8766')
+            if self._wants_player_page():
+                self._send(200, player_page(CHANNELS[0][0]), 'text/html; charset=utf-8')
+                return
+            origin = self._public_origin()
             lines = ['#EXTM3U']
             for slug, name, _s, _p, _d in CHANNELS:
                 lines.append('#EXTINF:-1,%s' % name)
-                lines.append('http://%s/%s.m3u8' % (host, slug))
+                lines.append('%s/%s.m3u8' % (origin, slug))
             self._send(200, '\n'.join(lines) + '\n', 'application/vnd.apple.mpegurl')
             return
         if path == '/diag':
@@ -639,6 +682,9 @@ class Handler(BaseHTTPRequestHandler):
             ch = CHANNEL_MAP.get(m.group(1))
             if not ch:
                 self._send(404, '未知频道\n')
+                return
+            if self._wants_player_page():
+                self._send(200, player_page(ch.slug), 'text/html; charset=utf-8')
                 return
             ensure_channel(ch)
             pl = build_playlist(ch)
@@ -660,9 +706,95 @@ def index_page():
             'body{font-family:-apple-system,Helvetica,Arial,sans-serif;max-width:720px;margin:0 auto;padding:20px;}'
             'li{margin:6px 0;}span{color:#888;font-size:12px;margin-left:8px;}</style></head>'
             '<body><h2>央视频全频道直播 (%d 路)</h2>'
-            '<p>把链接粘贴到播放器即可观看, 延迟约 20 秒。分片由播放器直连央视 CDN, 本机不跑视频流量。</p>'
-            '<p>聚合订阅: <a href="/all.m3u">/all.m3u</a> (63 路一次导入)</p>'
+            '<p>用浏览器打开下面的频道即可播放，延迟约 20 秒。分片由浏览器直连央视 CDN。</p>'
+            '<p>电视 / IPTV 导入 <a href="/all.m3u?raw=1">/all.m3u</a>。'
+            '浏览器打开 <a href="/all.m3u">/all.m3u</a> 会进入播放页。</p>'
             '<ul>%s</ul></body></html>' % (len(items), ''.join(items)))
+
+
+def player_page(initial):
+    channels = [{'slug': s, 'name': n} for s, n, _sid, _pid, _defn in CHANNELS]
+    if initial not in CHANNEL_MAP:
+        initial = channels[0]['slug']
+    payload = json.dumps({'initial': initial, 'channels': channels}, ensure_ascii=False)
+    return '''<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>央视频直播</title>
+<style>
+html,body{margin:0;height:100%;background:#111;color:#eee;font-family:-apple-system,Helvetica,Arial,sans-serif;}
+body{display:flex;min-height:100%;}
+main{flex:1;min-width:0;display:flex;flex-direction:column;}
+video{width:100%;flex:1;background:#000;max-height:calc(100vh - 36px);}
+#bar{height:36px;line-height:36px;padding:0 12px;font-size:13px;color:#aaa;}
+#err{color:#f66;}
+aside{width:240px;overflow:auto;background:#1b1b1b;border-left:1px solid #333;}
+button{display:block;width:100%;text-align:left;background:transparent;color:#ddd;border:0;border-bottom:1px solid #2a2a2a;padding:10px 12px;cursor:pointer;font-size:14px;}
+button.on{background:#333;color:#fff;}
+@media(max-width:720px){body{flex-direction:column;}aside{width:auto;max-height:40vh;}}
+</style></head><body>
+<main>
+<video id="v" controls autoplay playsinline></video>
+<div id="bar">正在加载… <span id="err"></span></div>
+</main>
+<aside id="list"></aside>
+<script id="data" type="application/json">''' + payload + '''</script>
+<script src="https://registry.npmmirror.com/hls.js/1.5.20/files/dist/hls.min.js"></script>
+<script>
+const data = JSON.parse(document.getElementById('data').textContent);
+const video = document.getElementById('v');
+const bar = document.getElementById('bar');
+const err = document.getElementById('err');
+const list = document.getElementById('list');
+let hls = null;
+function loadLib(src) {
+  return new Promise((resolve, reject) => {
+    if (window.Hls) { resolve(); return; }
+    const s = document.createElement('script');
+    s.src = src; s.onload = () => resolve(); s.onerror = reject;
+    document.head.appendChild(s);
+  });
+}
+function play(slug) {
+  const ch = data.channels.find(c => c.slug === slug) || data.channels[0];
+  slug = ch.slug;
+  err.textContent = '';
+  bar.firstChild.textContent = ch.name + ' ';
+  document.querySelectorAll('#list button').forEach(b => b.classList.toggle('on', b.dataset.slug === slug));
+  const url = '/' + slug + '.m3u8';
+  const start = () => {
+    if (window.Hls && Hls.isSupported()) {
+      if (hls) hls.destroy();
+      hls = new Hls({liveDurationInfinity: true, manifestLoadingTimeOut: 20000});
+      hls.loadSource(url);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}); });
+      hls.on(Hls.Events.ERROR, (_, d) => {
+        if (!d.fatal) return;
+        if (d.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
+        else if (d.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+        else err.textContent = '播放失败';
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = url;
+      video.play().catch(() => {});
+    } else {
+      err.textContent = '此浏览器无法播放';
+    }
+  };
+  if (window.Hls || video.canPlayType('application/vnd.apple.mpegurl')) start();
+  else loadLib('https://cdn.jsdelivr.net/npm/hls.js@1.5.20/dist/hls.min.js').then(start).catch(() => { err.textContent = '播放器脚本加载失败'; });
+  if (location.pathname !== '/' + slug + '.m3u8') history.replaceState(null, '', '/' + slug + '.m3u8');
+}
+data.channels.forEach(c => {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.dataset.slug = c.slug;
+  b.textContent = c.name;
+  b.onclick = () => play(c.slug);
+  list.appendChild(b);
+});
+play(data.initial);
+</script></body></html>'''
 
 
 def main():
